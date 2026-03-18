@@ -2,9 +2,9 @@
 /**
  * P2P Lambda MCP Server — Exposed via Streamable HTTP
  *
- * Auth model: Client sends their own P2P Lambda API key as Bearer token.
- * The server extracts it and creates a per-session API client.
- * No credentials are stored on the server.
+ * Auth model: Dual-mode — supports both direct Bearer passthrough
+ * and OAuth 2.0 Client Credentials grant.
+ * No permanent credentials are stored on the server.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -27,9 +27,29 @@ function zodToJsonSchema(schema: any): any {
 
 const PORT = parseInt(process.env.PORT || '3100', 10);
 const SERVER_BASE_URL = process.env.SERVER_BASE_URL || `http://localhost:${PORT}`;
+const SLUG = 'p2p-lambda';
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
+
+// --- OAuth token store (in-memory, ephemeral) ---
+const TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+interface OAuthToken {
+  apiKey: string;
+  expiresAt: number;
+}
+
+const oauthTokens = new Map<string, OAuthToken>();
+
+// Cleanup expired tokens every 10 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, data] of oauthTokens) {
+    if (now > data.expiresAt) oauthTokens.delete(token);
+  }
+}, 10 * 60 * 1000);
 
 // --- Static assets (logo) ---
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -43,8 +63,63 @@ app.get('/health', (_req, res) => {
     version: '1.0.0',
     tools: tools.length,
     transport: 'streamable-http',
-    auth: 'bearer-passthrough',
+    auth: 'dual-mode',
+    auth_modes: ['bearer-passthrough', 'oauth-client-credentials'],
   });
+});
+
+// --- OAuth 2.0 Discovery ---
+app.get('/.well-known/oauth-authorization-server', (_req, res) => {
+  res.json({
+    issuer: SERVER_BASE_URL,
+    token_endpoint: `${SERVER_BASE_URL}/oauth/token`,
+    revocation_endpoint: `${SERVER_BASE_URL}/oauth/revoke`,
+    grant_types_supported: ['client_credentials'],
+    token_endpoint_auth_methods_supported: ['client_secret_post'],
+    response_types_supported: ['token'],
+    service_documentation: `https://financemcps.agenticledger.ai/${SLUG}/`,
+  });
+});
+
+// --- OAuth 2.0 Token Exchange ---
+app.post('/oauth/token', (req, res) => {
+  const { grant_type, client_id, client_secret } = req.body;
+
+  if (grant_type !== 'client_credentials') {
+    res.status(400).json({ error: 'unsupported_grant_type', error_description: 'Only client_credentials is supported' });
+    return;
+  }
+
+  if (client_id !== SLUG) {
+    res.status(400).json({ error: 'invalid_client', error_description: `client_id must be "${SLUG}"` });
+    return;
+  }
+
+  if (!client_secret) {
+    res.status(400).json({ error: 'invalid_request', error_description: 'client_secret is required (your API key)' });
+    return;
+  }
+
+  const accessToken = `mcp_${randomUUID().replace(/-/g, '')}`;
+  const expiresIn = TOKEN_TTL_MS / 1000;
+
+  oauthTokens.set(accessToken, {
+    apiKey: client_secret,
+    expiresAt: Date.now() + TOKEN_TTL_MS,
+  });
+
+  res.json({
+    access_token: accessToken,
+    token_type: 'bearer',
+    expires_in: expiresIn,
+  });
+});
+
+// --- OAuth 2.0 Token Revocation ---
+app.post('/oauth/revoke', (req, res) => {
+  const { token } = req.body;
+  if (token) oauthTokens.delete(token);
+  res.status(200).json({ status: 'revoked' });
 });
 
 // --- Smart root route: content negotiation ---
@@ -63,10 +138,21 @@ app.get('/', (req, res) => {
     transport: 'streamable-http',
     tools: tools.length,
     auth: {
-      type: 'bearer-passthrough',
-      description: 'Pass your P2P Lambda API key as the Bearer token. No credentials are stored on this server.',
-      header: 'Authorization: Bearer <your-p2p-lambda-api-key>',
-      howToGetKey: 'Get your API key at https://p2p-lambda.readme.io'
+      type: 'dual-mode',
+      description: 'Supports both direct Bearer token and OAuth 2.0 Client Credentials',
+      modes: {
+        bearer: {
+          description: 'Pass your API key directly as the Bearer token',
+          header: 'Authorization: Bearer <your-api-key>',
+        },
+        oauth: {
+          description: 'Exchange credentials for a time-limited token',
+          token_endpoint: `${SERVER_BASE_URL}/oauth/token`,
+          client_id: SLUG,
+          client_secret: '<your-api-key>',
+          grant_type: 'client_credentials',
+        },
+      },
     },
     configTemplate: {
       mcpServers: {
@@ -78,16 +164,33 @@ app.get('/', (req, res) => {
     },
     links: {
       health: '/health',
-      documentation: 'https://financemcps.agenticledger.ai/p2p-lambda/'
+      documentation: 'https://financemcps.agenticledger.ai/p2p-lambda/',
+      oauth_discovery: '/.well-known/oauth-authorization-server',
     }
   });
 });
 
-// --- Extract Bearer token from request ---
-function extractBearerToken(req: express.Request): string | null {
+// --- Dual-mode API key resolver ---
+function resolveApiKey(req: express.Request): string | null {
   const auth = req.headers.authorization;
   if (!auth) return null;
-  return auth.replace(/^Bearer\s+/i, '');
+
+  const token = auth.replace(/^Bearer\s+/i, '');
+  if (!token) return null;
+
+  // Mode 1: OAuth-issued token
+  if (token.startsWith('mcp_')) {
+    const entry = oauthTokens.get(token);
+    if (!entry) return null;
+    if (Date.now() > entry.expiresAt) {
+      oauthTokens.delete(token);
+      return null;
+    }
+    return entry.apiKey;
+  }
+
+  // Mode 2: Raw API key passthrough
+  return token;
 }
 
 // --- Per-session state ---
@@ -148,16 +251,20 @@ app.post('/mcp', async (req, res) => {
     return;
   }
 
-  const token = extractBearerToken(req);
-  if (!token) {
+  const apiKey = resolveApiKey(req);
+  if (!apiKey) {
     res.status(401).json({
-      error: 'Missing Authorization header. Use: Bearer <your-p2p-lambda-api-key>',
+      error: 'Missing or invalid Authorization header.',
+      modes: {
+        bearer: 'Authorization: Bearer <your-api-key>',
+        oauth: `POST ${SERVER_BASE_URL}/oauth/token with client_id=${SLUG}&client_secret=<your-api-key>&grant_type=client_credentials`,
+      },
     });
     return;
   }
 
   // Create per-session API client with the user's credentials
-  const client = new P2PLambdaClient(token);
+  const client = new P2PLambdaClient(apiKey);
 
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => randomUUID(),
@@ -254,18 +361,25 @@ const BRANDED_LANDING_HTML = `<!DOCTYPE html>
     <div class="info-grid">
       <div class="info-row"><span class="label">Tools</span><span class="value">${tools.length}</span></div>
       <div class="info-row"><span class="label">Transport</span><span class="value">Streamable HTTP</span></div>
-      <div class="info-row"><span class="label">Auth</span><span class="value">Bearer Passthrough</span></div>
+      <div class="info-row"><span class="label">Auth</span><span class="value">Dual-Mode (Bearer + OAuth)</span></div>
     </div>
 
     <div class="section-title">Enter your P2P Lambda API key</div>
     <input type="text" class="key-input" id="apiKeyInput" placeholder="your-p2p-lambda-api-key" oninput="updateConfig()">
     <div class="key-hint">Your key stays in your browser — it is never sent to this server. Get a key at <a href="https://p2p-lambda.readme.io" target="_blank" style="color:var(--primary)">p2p-lambda.readme.io</a></div>
 
-    <div class="section-title">MCP Configuration</div>
+    <div class="section-title">MCP Configuration (Bearer)</div>
     <p style="font-size:13px;color:var(--muted);margin-bottom:12px;">Add to your <strong style="color:var(--fg)">claude_desktop_config.json</strong> or <strong style="color:var(--fg)">.mcp.json</strong>:</p>
     <div class="config-block">
       <button class="config-copy" onclick="copyConfig()">Copy</button>
       <pre class="config-pre" id="configBlock"></pre>
+    </div>
+
+    <div class="section-title">OAuth Configuration (Claude.ai / Agent Platforms)</div>
+    <p style="font-size:13px;color:var(--muted);margin-bottom:12px;">For platforms that require OAuth Client Credentials:</p>
+    <div class="config-block">
+      <button class="config-copy" onclick="copyOAuth()">Copy</button>
+      <pre class="config-pre" id="oauthBlock"></pre>
     </div>
 
     <div class="trust">
@@ -280,11 +394,21 @@ const BRANDED_LANDING_HTML = `<!DOCTYPE html>
       var key=document.getElementById('apiKeyInput').value||'<your-api-key>';
       var config=JSON.stringify({mcpServers:{"p2p-lambda":{url:"${SERVER_BASE_URL}/mcp",headers:{Authorization:"Bearer "+key}}}},null,2);
       document.getElementById('configBlock').textContent=config;
+      var oauth="Token URL:      ${SERVER_BASE_URL}/oauth/token\\nClient ID:      ${SLUG}\\nClient Secret:  "+key+"\\nGrant Type:     client_credentials";
+      document.getElementById('oauthBlock').textContent=oauth;
     }
     function copyConfig(){
       var text=document.getElementById('configBlock').textContent;
       navigator.clipboard.writeText(text).then(function(){
-        var btn=document.querySelector('.config-copy');
+        var btn=document.querySelectorAll('.config-copy')[0];
+        btn.textContent='Copied!';btn.classList.add('copied');
+        setTimeout(function(){btn.textContent='Copy';btn.classList.remove('copied');},2000);
+      });
+    }
+    function copyOAuth(){
+      var text=document.getElementById('oauthBlock').textContent;
+      navigator.clipboard.writeText(text).then(function(){
+        var btn=document.querySelectorAll('.config-copy')[1];
         btn.textContent='Copied!';btn.classList.add('copied');
         setTimeout(function(){btn.textContent='Copy';btn.classList.remove('copied');},2000);
       });
@@ -297,9 +421,11 @@ const BRANDED_LANDING_HTML = `<!DOCTYPE html>
 app.listen(PORT, () => {
   console.log(`P2P Lambda MCP HTTP Server running on port ${PORT}`);
   console.log(`  MCP endpoint:   ${SERVER_BASE_URL}/mcp`);
+  console.log(`  OAuth token:    ${SERVER_BASE_URL}/oauth/token`);
+  console.log(`  OAuth discovery: ${SERVER_BASE_URL}/.well-known/oauth-authorization-server`);
   console.log(`  Health check:   ${SERVER_BASE_URL}/health`);
   console.log(`  Landing page:   ${SERVER_BASE_URL}/`);
   console.log(`  Tools:          ${tools.length}`);
   console.log(`  Transport:      Streamable HTTP`);
-  console.log(`  Auth:           Bearer passthrough (client provides service key)`);
+  console.log(`  Auth:           Dual-mode (Bearer passthrough + OAuth Client Credentials)`);
 });
