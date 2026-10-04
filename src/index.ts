@@ -8,7 +8,7 @@
  * No permanent credentials are stored on the server.
  */
 
-import { randomUUID, createHash } from 'node:crypto';
+import { randomUUID, createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
@@ -17,9 +17,10 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  isInitializeRequest,
 } from '@modelcontextprotocol/sdk/types.js';
 import { zodToJsonSchema as _zodToJsonSchema } from 'zod-to-json-schema';
-import { P2PLambdaClient } from './api-client.js';
+import { P2PLambdaClient, ProviderError } from './api-client.js';
 import { tools } from './tools.js';
 
 function zodToJsonSchema(schema: any): any {
@@ -30,12 +31,26 @@ const PORT = parseInt(process.env.PORT || '3100', 10);
 const SERVER_BASE_URL = process.env.SERVER_BASE_URL || `http://localhost:${PORT}`;
 const SLUG = 'p2p-lambda';
 
+export interface AppOptions {
+  fetch?: typeof fetch;
+  now?: () => number;
+  tokenTtlMs?: number;
+  sessionIdleMs?: number;
+  maxSessions?: number;
+  cleanupIntervalMs?: number;
+}
+
+// Dependency injection is local-only; production never reads an upstream override.
+export function createApp(options: AppOptions = {}) {
+const now = options.now ?? Date.now;
+const idleMs = options.sessionIdleMs ?? 15 * 60 * 1000;
+const maxSessions = options.maxSessions ?? 100;
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
 // --- OAuth token store (in-memory, ephemeral) ---
-const TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
+const TOKEN_TTL_MS = options.tokenTtlMs ?? 60 * 60 * 1000; // 1 hour
 
 interface OAuthToken {
   apiKey: string;
@@ -43,14 +58,6 @@ interface OAuthToken {
 }
 
 const oauthTokens = new Map<string, OAuthToken>();
-
-// Cleanup expired tokens every 10 minutes
-setInterval(() => {
-  const now = Date.now();
-  for (const [token, data] of oauthTokens) {
-    if (now > data.expiresAt) oauthTokens.delete(token);
-  }
-}, 10 * 60 * 1000);
 
 // --- OAuth authorization code store (in-memory, ephemeral) ---
 const AUTH_CODE_TTL_MS = 5 * 60 * 1000; // 5 minutes
@@ -64,14 +71,6 @@ interface AuthCode {
 }
 
 const authCodes = new Map<string, AuthCode>();
-
-// Cleanup expired auth codes every 2 minutes
-setInterval(() => {
-  const now = Date.now();
-  for (const [code, data] of authCodes) {
-    if (now > data.expiresAt) authCodes.delete(code);
-  }
-}, 2 * 60 * 1000);
 
 // PKCE S256 verifier
 function verifyPKCE(codeVerifier: string, codeChallenge: string, method: string): boolean {
@@ -160,7 +159,7 @@ app.get('/authorize', (req, res) => {
 app.post('/authorize', (req, res) => {
   const { api_key, client_id, redirect_uri, code_challenge, code_challenge_method, state, scope } = req.body;
 
-  if (!api_key) {
+  if (typeof api_key !== 'string' || !validCredential(api_key)) {
     res.status(400).send('API key is required');
     return;
   }
@@ -173,12 +172,13 @@ app.post('/authorize', (req, res) => {
   // Generate authorization code
   const code = `authcode_${randomUUID().replace(/-/g, '')}`;
 
+  if (authCodes.size >= 200) { res.status(503).json({ error: 'capacity_exceeded' }); return; }
   authCodes.set(code, {
     apiKey: api_key,
     codeChallenge: code_challenge || '',
     codeChallengeMethod: code_challenge_method || 'S256',
     redirectUri: redirect_uri,
-    expiresAt: Date.now() + AUTH_CODE_TTL_MS,
+    expiresAt: now() + AUTH_CODE_TTL_MS,
   });
 
   // Redirect back to the client with the code
@@ -212,7 +212,7 @@ app.post('/oauth/token', (req, res) => {
     authCodes.delete(code);
 
     // Check expiry
-    if (Date.now() > entry.expiresAt) {
+    if (now() >= entry.expiresAt) {
       res.status(400).json({ error: 'invalid_grant', error_description: 'Authorization code expired' });
       return;
     }
@@ -239,9 +239,10 @@ app.post('/oauth/token', (req, res) => {
     const accessToken = `mcp_${randomUUID().replace(/-/g, '')}`;
     const expiresIn = TOKEN_TTL_MS / 1000;
 
+    if (oauthTokens.size >= 200) { res.status(503).json({ error: 'capacity_exceeded' }); return; }
     oauthTokens.set(accessToken, {
       apiKey: entry.apiKey,
-      expiresAt: Date.now() + TOKEN_TTL_MS,
+      expiresAt: now() + TOKEN_TTL_MS,
     });
 
     res.json({
@@ -261,7 +262,7 @@ app.post('/oauth/token', (req, res) => {
       return;
     }
 
-    if (!client_secret) {
+    if (typeof client_secret !== 'string' || !validCredential(client_secret)) {
       res.status(400).json({ error: 'invalid_request', error_description: 'client_secret is required (your API key)' });
       return;
     }
@@ -269,9 +270,10 @@ app.post('/oauth/token', (req, res) => {
     const accessToken = `mcp_${randomUUID().replace(/-/g, '')}`;
     const expiresIn = TOKEN_TTL_MS / 1000;
 
+    if (oauthTokens.size >= 200) { res.status(503).json({ error: 'capacity_exceeded' }); return; }
     oauthTokens.set(accessToken, {
       apiKey: client_secret,
-      expiresAt: Date.now() + TOKEN_TTL_MS,
+      expiresAt: now() + TOKEN_TTL_MS,
     });
 
     res.json({
@@ -341,18 +343,22 @@ app.get('/', (req, res) => {
 });
 
 // --- Dual-mode API key resolver ---
+function validCredential(value: string): boolean {
+  return value.length > 0 && value.length <= 4096 && !/[\s\x00-\x1f\x7f]/.test(value);
+}
+
 function resolveApiKey(req: express.Request): string | null {
   const auth = req.headers.authorization;
-  if (!auth) return null;
+  if (!auth || typeof auth !== 'string') return null;
 
   const token = auth.replace(/^Bearer\s+/i, '');
-  if (!token) return null;
+  if (!validCredential(token)) return null;
 
   // Mode 1: OAuth-issued token
   if (token.startsWith('mcp_')) {
     const entry = oauthTokens.get(token);
     if (!entry) return null;
-    if (Date.now() > entry.expiresAt) {
+    if (now() >= entry.expiresAt) {
       oauthTokens.delete(token);
       return null;
     }
@@ -368,9 +374,33 @@ interface SessionState {
   server: Server;
   transport: StreamableHTTPServerTransport;
   client: P2PLambdaClient;
+  owner: Buffer;
+  lastUsed: number;
+  activeRequests: number;
 }
 
 const sessions = new Map<string, SessionState>();
+const ownerSalt = randomBytes(32);
+const ownerOf = (credential: string) => createHmac('sha256', ownerSalt).update(credential).digest();
+let pendingSessions = 0;
+let stopping = false;
+
+async function closeSession(id: string) {
+  const state = sessions.get(id);
+  if (!state) return;
+  sessions.delete(id); // Remove before awaiting: close/re-entry is idempotent.
+  await state.server.close().catch(() => {});
+}
+
+async function cleanup() {
+  const time = now();
+  for (const [token, value] of oauthTokens) if (time >= value.expiresAt) oauthTokens.delete(token);
+  for (const [code, value] of authCodes) if (time >= value.expiresAt) authCodes.delete(code);
+  await Promise.all([...sessions].filter(([, value]) => value.activeRequests === 0 && time - value.lastUsed >= idleMs)
+    .map(([id]) => closeSession(id)));
+}
+const cleanupTimer = setInterval(() => { void cleanup(); }, options.cleanupIntervalMs ?? 30_000);
+cleanupTimer.unref();
 
 function createMCPServer(client: P2PLambdaClient): Server {
   const server = new Server(
@@ -391,16 +421,17 @@ function createMCPServer(client: P2PLambdaClient): Server {
     const tool = tools.find((t) => t.name === name);
 
     if (!tool) {
-      throw new Error(`Unknown tool: ${name}`);
+      throw new Error('Unknown tool');
     }
 
     try {
-      const result = await tool.handler(client, args as any);
+      const validatedArgs = tool.inputSchema.parse(args ?? {});
+      const result = await tool.handler(client, validatedArgs as any);
       return {
         content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }],
       };
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = error instanceof ProviderError ? error.message : 'Tool request failed';
       return {
         content: [{ type: 'text' as const, text: `Error: ${message}` }],
         isError: true,
@@ -411,81 +442,96 @@ function createMCPServer(client: P2PLambdaClient): Server {
   return server;
 }
 
-// --- Streamable HTTP endpoint ---
-app.post('/mcp', async (req, res) => {
-  const sessionId = req.headers['mcp-session-id'] as string | undefined;
-
-  if (sessionId && sessions.has(sessionId)) {
-    const { transport } = sessions.get(sessionId)!;
-    await transport.handleRequest(req, res, req.body);
+// Authenticate before inspecting or using any session, for all three methods.
+const mcpHandler: express.RequestHandler = (req, res, next) => {
+  void handleMcp(req, res).catch(next);
+};
+async function handleMcp(req: express.Request, res: express.Response) {
+  const credential = resolveApiKey(req);
+  if (!credential) { res.status(401).json({ error: 'Authentication required' }); return; }
+  if (stopping) { res.status(503).json({ error: 'Service stopping' }); return; }
+  const sessionId = req.headers['mcp-session-id'];
+  if (sessionId !== undefined) {
+    if (typeof sessionId !== 'string') { res.status(400).json({ error: 'Invalid session' }); return; }
+    const state = sessions.get(sessionId);
+    if (!state) { res.status(404).json({ error: 'Session not found' }); return; }
+    if (!timingSafeEqual(state.owner, ownerOf(credential))) {
+      res.status(403).json({ error: 'Session access denied' }); return;
+    }
+    if (state.activeRequests === 0 && now() - state.lastUsed >= idleMs) {
+      await closeSession(sessionId);
+      res.status(404).json({ error: 'Session expired' }); return;
+    }
+    state.lastUsed = now();
+    if (req.method === 'DELETE') {
+      await closeSession(sessionId);
+      res.status(200).json({ status: 'session closed' }); return;
+    }
+    // GET SSE does not pin an otherwise idle session indefinitely.
+    if (req.method === 'POST') state.activeRequests++;
+    try { await state.transport.handleRequest(req, res, req.body); }
+    finally {
+      if (req.method === 'POST') state.activeRequests--;
+      state.lastUsed = now();
+    }
     return;
   }
-
-  const apiKey = resolveApiKey(req);
-  if (!apiKey) {
-    res.status(401).json({
-      error: 'Missing or invalid Authorization header.',
-      modes: {
-        bearer: 'Authorization: Bearer <your-api-key>',
-        oauth: `POST ${SERVER_BASE_URL}/oauth/token with client_id=${SLUG}&client_secret=<your-api-key>&grant_type=client_credentials`,
-      },
-    });
-    return;
+  if (req.method !== 'POST' || !isInitializeRequest(req.body)) {
+    res.status(400).json({ error: 'Valid initialization required' }); return;
   }
-
-  // Create per-session API client with the user's credentials
-  const client = new P2PLambdaClient(apiKey);
-
+  await cleanup();
+  if (sessions.size + pendingSessions >= maxSessions) {
+    res.status(503).json({ error: 'Session capacity exceeded' }); return;
+  }
+  pendingSessions++;
+  const client = new P2PLambdaClient(credential, options.fetch);
+  const server = createMCPServer(client);
+  let registeredId: string | undefined;
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => randomUUID(),
+    onsessioninitialized: (id) => {
+      registeredId = id;
+      sessions.set(id, { server, transport, client, owner: ownerOf(credential), lastUsed: now(), activeRequests: 0 });
+    },
   });
-
-  const server = createMCPServer(client);
-
-  transport.onclose = () => {
-    const sid = transport.sessionId;
-    if (sid) {
-      sessions.delete(sid);
-      console.log(`[mcp] Session closed: ${sid}`);
+  try {
+    await server.connect(transport);
+    // Register cleanup after connect; preserve the SDK's own close callback.
+    const sdkClose = transport.onclose;
+    transport.onclose = () => {
+      if (registeredId) sessions.delete(registeredId);
+      sdkClose?.();
+    };
+    await transport.handleRequest(req, res, req.body);
+    if (!registeredId || res.statusCode >= 400) {
+      if (registeredId) sessions.delete(registeredId);
+      await server.close();
     }
-  };
+  } catch (error) {
+    if (registeredId) sessions.delete(registeredId);
+    await server.close().catch(() => {});
+    throw error;
+  } finally { pendingSessions--; }
+}
+app.post('/mcp', mcpHandler);
+app.get('/mcp', mcpHandler);
+app.delete('/mcp', mcpHandler);
 
-  await server.connect(transport);
-  await transport.handleRequest(req, res, req.body);
-
-  const newSessionId = transport.sessionId;
-  if (newSessionId) {
-    sessions.set(newSessionId, { server, transport, client });
-    console.log(`[mcp] New session: ${newSessionId}`);
-  }
-});
-
-// GET /mcp — SSE stream for server notifications
-app.get('/mcp', async (req, res) => {
-  const sessionId = req.headers['mcp-session-id'] as string | undefined;
-  if (!sessionId || !sessions.has(sessionId)) {
-    res.status(400).json({ error: 'Invalid or missing session. Send initialization POST first.' });
-    return;
-  }
-  const { transport } = sessions.get(sessionId)!;
-  await transport.handleRequest(req, res);
-});
-
-// DELETE /mcp — close session
-app.delete('/mcp', async (req, res) => {
-  const sessionId = req.headers['mcp-session-id'] as string | undefined;
-  if (!sessionId || !sessions.has(sessionId)) {
-    res.status(404).json({ error: 'Session not found' });
-    return;
-  }
-  const { transport, server } = sessions.get(sessionId)!;
-  await transport.close();
-  await server.close();
-  sessions.delete(sessionId);
-  res.status(200).json({ status: 'session closed' });
+// Never let Express reflect parser errors, credentials, provider bodies or stack traces.
+app.use((_error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  if (!res.headersSent) res.status(400).json({ error: 'Request rejected' });
+  else res.end();
 });
 
 // ==================== OAUTH AUTHORIZE CONSENT PAGE ====================
+// Encode once at the HTML rendering boundary. Browser form values decode back
+// to the original OAuth strings; do not URL-encode or pre-escape stored values.
+function escapeHtml(value: string): string {
+  return String(value).replace(/[&<>"']/g, (character) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  })[character]!);
+}
+
 function AUTHORIZE_HTML(clientId: string, redirectUri: string, codeChallenge: string, codeChallengeMethod: string, state: string, scope: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -520,14 +566,14 @@ function AUTHORIZE_HTML(clientId: string, redirectUri: string, codeChallenge: st
   <div class="card">
     <div class="header"><img src="/static/logo.png" alt="AgenticLedger"><span>P2P Lambda MCP</span></div>
     <div class="consent-msg">An application wants to connect to <strong>P2P Lambda MCP Server</strong> on your behalf. Enter your API key to authorize access.</div>
-    ${scope ? `<div class="scope-badge">Scope: ${scope}</div>` : ''}
+    ${scope ? `<div class="scope-badge">Scope: ${escapeHtml(scope)}</div>` : ''}
     <form method="POST" action="/authorize">
-      <input type="hidden" name="client_id" value="${clientId}">
-      <input type="hidden" name="redirect_uri" value="${redirectUri}">
-      <input type="hidden" name="code_challenge" value="${codeChallenge}">
-      <input type="hidden" name="code_challenge_method" value="${codeChallengeMethod}">
-      <input type="hidden" name="state" value="${state}">
-      <input type="hidden" name="scope" value="${scope}">
+      <input type="hidden" name="client_id" value="${escapeHtml(clientId)}">
+      <input type="hidden" name="redirect_uri" value="${escapeHtml(redirectUri)}">
+      <input type="hidden" name="code_challenge" value="${escapeHtml(codeChallenge)}">
+      <input type="hidden" name="code_challenge_method" value="${escapeHtml(codeChallengeMethod)}">
+      <input type="hidden" name="state" value="${escapeHtml(state)}">
+      <input type="hidden" name="scope" value="${escapeHtml(scope)}">
       <label class="key-label">Your P2P Lambda API Key</label>
       <input type="password" class="key-input" name="api_key" id="apiKey" placeholder="Enter your API key" required autofocus oninput="document.getElementById('authBtn').disabled=!this.value">
       <div class="key-hint">Your key is used to create a temporary access token. It is not stored permanently on this server.</div>
@@ -643,14 +689,27 @@ const BRANDED_LANDING_HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
-app.listen(PORT, () => {
-  console.log(`P2P Lambda MCP HTTP Server running on port ${PORT}`);
-  console.log(`  MCP endpoint:   ${SERVER_BASE_URL}/mcp`);
-  console.log(`  OAuth token:    ${SERVER_BASE_URL}/oauth/token`);
-  console.log(`  OAuth discovery: ${SERVER_BASE_URL}/.well-known/oauth-authorization-server`);
-  console.log(`  Health check:   ${SERVER_BASE_URL}/health`);
-  console.log(`  Landing page:   ${SERVER_BASE_URL}/`);
-  console.log(`  Tools:          ${tools.length}`);
-  console.log(`  Transport:      Streamable HTTP`);
-  console.log(`  Auth:           Dual-mode (Bearer passthrough + OAuth Client Credentials)`);
-});
+return {
+  app,
+  cleanup,
+  async close() {
+    stopping = true;
+    clearInterval(cleanupTimer);
+    oauthTokens.clear();
+    authCodes.clear();
+    await Promise.all([...sessions.keys()].map(closeSession));
+  },
+};
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const runtime = createApp();
+  const listener = runtime.app.listen(PORT, () => console.log('P2P Lambda MCP listening'));
+  const shutdown = () => {
+    listener.close();
+    void runtime.close();
+    setTimeout(() => process.exit(0), 5_000).unref();
+  };
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
+}

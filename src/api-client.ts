@@ -6,10 +6,12 @@
 
 const BASE_URL = 'https://api.lambda.p2p.org';
 
+export class ProviderError extends Error {}
+
 export class P2PLambdaClient {
   private apiKey: string;
 
-  constructor(apiKey: string) {
+  constructor(apiKey: string, private readonly requestFetch: typeof fetch = fetch) {
     this.apiKey = apiKey;
   }
 
@@ -31,6 +33,8 @@ export class P2PLambdaClient {
 
     const options: RequestInit = {
       method,
+      redirect: 'error',
+      signal: AbortSignal.timeout(15_000),
       headers: {
         'Authorization': this.apiKey,
         'Accept': 'application/json',
@@ -39,18 +43,18 @@ export class P2PLambdaClient {
       ...(body ? { body: JSON.stringify(body) } : {}),
     };
 
-    const response = await fetch(url.toString(), options);
-
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`API Error ${response.status}: ${text}`);
+    try {
+      const response = await this.requestFetch(url.toString(), options);
+      if (!response.ok) {
+        await response.body?.cancel();
+        throw new ProviderError(`Provider request failed (HTTP ${response.status})`);
+      }
+      if (response.status === 204) return {} as T;
+      return await response.json() as T;
+    } catch (error) {
+      if (error instanceof ProviderError) throw error;
+      throw new ProviderError('Provider request failed');
     }
-
-    if (response.status === 204) {
-      return {} as T;
-    }
-
-    return response.json();
   }
 
   // === Chains ===
